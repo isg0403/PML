@@ -1,0 +1,428 @@
+---
+title: "Qualitative Activity Recognition Project"
+author: "Ioannis"
+date: "May 11, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache=TRUE, message=FALSE, warning=FALSE) 
+options(scipen=999, digits=2)
+library(kableExtra)
+options(knitr.table.format = "html")
+```
+
+\< word count: 1980, excluding code and code output\>
+
+### Summary
+The purpose of this project was to examine to which extent the WLE dataset can be used to predict the manner in which bicep curls were performed using machine learning techniques.
+
+It turns out that if one randomly selects test points from the time series in WLE, random forests are perfectly capable of finding the place of extraction and hence the manner of execution (i.e., correct or with various mistakes). However, the WLE dataset contains data of too few users to allow for true generalization capabilities: prediction for new users is very poor.
+
+Next, without access to the training set of other users, a single user could create his/her own training set (under supervision of a personal trainer) and use it to evaluate future exercises. Also here the prerequisite is that enough measurement points are included in the training set.
+
+
+### 1. Introduction
+
+The goal of this project was to replicate to the extent possible Machine Learning (ML)-related research on correct execution of sport exercises, as described in the paper "Qualitative Activity Recognition of Weight-lifting Exercises" ([qar]) and associated project website ([har]). A second goal was to do some further experiments using the WLE dataset and to investigate more specific questions.
+
+**The QAR Experiments**  
+One of the questions addressed in above-mentioned article is whether it is possible to recognize correct execution of bicep curls using a *machine learning* approach. For this purpose six participants were asked to perform one set of 10 repetitions of bicep curls using a dumbbell in five different fashions: 
+
+* exactly according to the specification - class A,
+* making 4 typical mistakes - classes B to E.
+
+Sensory devices were attached to four locations. During the execution of the bicep curls the raw measurements from the sensors were being recorded. These measuremens have been made available in the "Weight Lifting Exercises" dataset ([wle]).
+
+**Further questions**  
+This report also addresses the following questions:
+
+1. Should identification of errors be possible for a *new* person whose data was not present in the training set?
+2. If the training set contains measurements for all cases by the user of the system, is data of *other* persons needed?
+
+
+### 2. Exploratory Data Analysis
+
+#### **Downloading and importing dataset**  
+The version of the WLE dataset used in this report was downloaded from below link.
+```{r download}
+download_WLE <- function(file){
+    url_WLE <- "https://d396qusza40orc.cloudfront.net/predmachlearn/"
+    if (!file.exists(paste0("../../data/", file)))
+        download.file(paste0(url_WLE, file), destfile=paste0("../../data/", file), quiet=TRUE)
+}
+download_WLE("pml-training.csv"); download_WLE("pml-testing.csv")
+```
+
+From the article and inspection of the downloaded files it could be deduced that there are three kinds of variables in the original dataset:
+
+1. admin/logistic, such as person performing exercise, class of error, time stamp;
+2. raw measurements from sensors;
+3. derived features: summary statistics for some of the raw measurements.
+
+It was decided not to use the included derived features, as their values could not be reproduced. (Instead, derived features will be generated from the raw measurements, but more on this later). The names of the raw measurement variables were placed in a text file, and this list is being used to select the desired columns from the downloaded dataset.
+
+```{r load}
+library(dplyr)
+raw_measure_vars <- read.csv("../../data/raw_measure_vars.txt", header=FALSE, colClasses = "character")[,1]
+cat("Raw measure variables:", paste(raw_measure_vars[1:6], collapse = ", "), "etc.\n")
+read_data <- function(file_name) {
+    df <- read.csv(paste0("../../data/", file_name), na.strings = c("NA", "#DIV/0!", ""))
+    if (length(grep("training", file_name)>0))
+        select(df, classe, user_name, num_window, raw_timestamp_part_1, raw_timestamp_part_2, raw_measure_vars)
+    else
+        select(df, user_name, num_window, raw_measure_vars)
+}
+data1 <- read_data("pml-training.csv"); valid1 <- read_data("pml-testing.csv")
+# sort data by recording time; then remove time stamp variables as not needed anymore
+data1o <- arrange(data1, user_name, raw_timestamp_part_1, raw_timestamp_part_2) %>%
+          select(-raw_timestamp_part_1, -raw_timestamp_part_2)
+cat("dimensions: data:", dim(data1o), "validation:", dim(valid1))
+```
+
+<br>
+
+#### **Understanding the dataset**
+
+The structure of the remaining objects can be expressed by the following schematic:
+
+<p style="text-align:center; color:darkblue; font-size:110%" markdown="1"; >Date ---<sub>1+</sub> Person ---<sub>1+</sub> Class ---<sub>1+</sub> Window ---<sub>1+</sub> Time Instance ---  Observation  ---<sub>1+</sub> Raw measurement</p>  
+
+In each time instance raw measurements are recorded from all sensors, making for 1 observation; one observation is stored in 1 row in the dataset. Each window contains 23 observations on average and is uniquely linked to *one* error class (A to E) and to *one* person.
+
+Below tables shows how many windows and observations were present for each participant and error class, resp, in the original dataset.
+
+```{r eda, fig.height=3, fig.width=10, fig.align="center"}
+library(gridExtra); library(grid)
+t1 <- with(data1o, tapply(num_window, list(user_name, classe), function(x) length(unique(x))))
+t2 <- table(data1o$user_name, data1o$classe)  
+t3 <- round(t2/t1, 1)
+grid.arrange(
+    arrangeGrob(tableGrob(t1), tableGrob(t2), tableGrob(t3), ncol=3),
+    arrangeGrob(textGrob("Number of Windows"), textGrob("Number of Observations"), textGrob("Average Observations per Window"), ncol=3), heights=c(2, 0.5))
+grid.rect(width = 1, height = 1, gp = gpar(lwd = 1, col = "black", fill = NA ))
+```
+<p style="text-align: center;font-size=90%" markdown="1"> Figure 1 </p>
+
+A variable that would be very useful for the correct classification of bicep curls, is one which would identify the observations belonging to 1 bicep curl. This would allow calculation of reliable summary statistics per error class (see Feature Selection).
+
+Unfortunately the "num_window" is not a reliable indication of a bicep curl as, although the *average* number of observations per window is in a close range around 23, the actual range is much wider: there are windows which have only 1 observation, up to 38 observations.
+```{r obsperwin}
+range(table(data1o$num_window))
+```
+<br>
+
+#### **Data cleanup**
+The original dataset contains a relative large amount of errors: a) sensor errors and b) variables which lack values for a certain person and error class. These variables cannot be included in the training set, as the ML algorithms cannot deal with missing values.
+
+To remove *part* of the sensor errors, windows from the beginning and ending sequences of each person were deleted after visual inspection. More could be done in this area if further analysis deems this activity worth the effort.
+
+Six variables turned out to have only zeros for a certain person and error class; these were removed from both the training and validation set.
+
+```{r dataCleanup}
+users <- unique(data1o$user_name)
+NZ_byuser <- function(df){
+     NZ_vals <- numeric()    # will contain near zero (NZ) variables
+    for (user in users){
+        user_data <- subset(df, user_name == user, select=-user_name) # exclude user_name from NZ analysis
+        NZ_vals <- append(NZ_vals, caret::nearZeroVar(user_data)+1)   # add 1 to index because user_name was temp. removed
+    }
+    cat("Variables being removed:",  paste(colnames(df)[NZ_vals], collapse=", "), "\n")
+    colnames(df)[which(!(1:ncol(df) %in% NZ_vals ))]
+}
+keep_cols <- NZ_byuser(data1o)
+data2 <- data1o[, keep_cols]; valid2 <- valid1[, setdiff(keep_cols, "classe")]
+# delete windows containing sensor errors from start and end of user sequences
+del_windows <- c(175:196,646:648,9:10,863, 11:18, 322:335, 46:54,843,821,630:631,217:225,632:634, 818:820,1:2,402:404,795, 652:667, 774:776, 169:173,308:321, 405:416, 793:794, 3, 514:515,650:651,777)
+data2b <- filter(data2, !(num_window %in% del_windows))
+cat("New dimensions: data:", dim(data2b), ", validation:", dim(valid2))
+```
+<br>
+
+#### **Understanding raw measurements**
+In Figure 2 below two variables are plotted for three distinct users. Each time series comprises of class A to E curl belt executions, in that order.
+
+As one can see, the mean values per user are quite distinct. This raises the question of whether the ML algorithms will be able to extract the patterns unique to a class, or will simply "remember" each user's time series.
+
+
+```{r fig1, fig.width=20, fig.height=10}
+colors <- c("green3", "blue", "turquoise", "red", "purple")
+data3 <- cbind(color=colors[as.numeric(data2b$classe)], data2b)
+
+par(mfrow=c(1,2), mar=c(5,3,4,1), cex.main=1.5, cex.lab=1.5)
+# plot 1
+y_min <- min(data3$yaw_dumbbell); y_max <- max(data3$yaw_dumbbell)
+with(subset(data3, user_name=="charles"), plot(yaw_dumbbell, col="blue", type="l", main="Yaw Dumbbell measurements of 3 users", ylim=c(y_min, y_max),xlim=c(0,2450), ylab="", xlab=""))
+with(subset(data3, user_name=="pedro"), lines(yaw_dumbbell, col="purple"))  
+with(subset(data3, user_name=="jeremy"), lines(yaw_dumbbell, col="turquoise"))
+#plot 2
+y_min=min(data3$roll_belt); y_max=max(data3$roll_belt)
+with(subset(data3, user_name=="carlitos"), 
+     plot(roll_belt, pch=".", col=color, main="Roll Belt measurements of 3 (different) users", ylim=c(y_min, y_max), ylab="", xlab="", cex=1.5))
+with(subset(data3, user_name=="pedro"), lines(roll_belt, col="blue"))
+with(subset(data3, user_name=="charles"), lines(roll_belt, col="red"))
+```
+<p style="text-align: center;font-size=90%; color=black" markdown="1"> Figure 2 - Sequence of class A to E measurements</p>
+
+Another fact that could be deduced by further dataset analysis is that each user performed the curl bets in the strict order class A to E, without repeats of previously performed classes. This is important to know for when test set observations will be extracted, in the next section.
+
+For variable "roll belt" (right plot in Figure 2) in the lower time series (centered around y=0) the change of execution class is shown: each class is shown in a different color. The last class (E) corresponds to an execution while "throwing the hips to the front". From the oscilating behaviour of the belt-related variable one can infer the individual bicep curls.
+
+
+### 3. Feature Selection
+
+Two datasets will be used in the ML algorithms that will be trained in the next section, containing:
+
+1. cleaned, raw measurements: dataset "data3",
+2. derived features: summary statistics per window: "win_summ".
+
+<br>
+
+#### **Preprocessing for win_summ dataset**
+The creation of the win_summ happens in two steps:
+
+1. scaling of cleaned, raw measurements variables,
+2. summary statistics calculation on the scaled set.
+
+The scaling is performed in an attempt to remove the user-specific characteristics of all time series. More precisely, the time series of all variables are recentered and rescaled such that:
+
+<p style="text-align:center;color:darkblue;" markdown="1"> for each user: class A will have mean of 0 and standard dev of 1</p>
+
+By using *one* set of scaling factors for all classes, the relative difference between classes is maintained, allowing for classification applications.
+
+```{r fset_1}
+sm = table(data3$num_window)                             # how many rows per window
+tiny_win = as.integer(names(sm[(sm %in% c(1,2))]))       # windows with 1 or two observations are removed
+data4 <- subset(data3, !(num_window %in% tiny_win))      # as they mess up summ. statistics calculation
+scale_byA  <- function(df){
+    msr_cols <- seq(which(names(df)=="roll_belt"), ncol(df))
+    df2 <- rbind(df);      df2[, msr_cols] <- NA
+    for (user in users){
+        user_idx <- which(df$user_name == user)
+        A_seq <- subset(df[user_idx,], classe=="A")
+        user_means <- colMeans(A_seq[, msr_cols])
+        user_std <- apply(A_seq[, msr_cols], 2, sd)
+        df2[user_idx, msr_cols] <- scale(df[user_idx, msr_cols], center=user_means, scale=user_std)
+    }
+    return(df2)
+}
+data4 <- scale_byA(data4)
+# Testing
+mn1 <- mean(subset(data4, classe=="A", select=roll_belt)[,1])              # should be 0
+sd1 <- sd(subset(data4, classe=="A", select=yaw_belt)[,1], na.rm = T)      # should be 1
+cat(round(mn1, 3), sd1)
+```
+
+The second step is to calculate summary statistics. Ideally one would like to calculate these per bicep curl execution. Unfortunately, there is no variable in the original dataset that links raw measurements to one particular bicep curl. If one could be sure that *exactly* 10 bicep curls where performed by each user for each class (as mentioned in the article), one could work around this limitation. However, this cannot be deduced from the dataset as the number of observations per class is quite diverse (see Figure 1 - Number of Observations).
+
+Thus the best available unit to calculate statistics on is observations belonging to one *window*.
+
+```{r fset_2}
+win_summ <- group_by(data4, user_name, classe, num_window) %>%
+            summarise_if(.predicate = is.numeric, funs(mean, median, sd))
+cat("Dimensions summary data:", dim(win_summ), "\n")
+```
+
+```{r barplotA, fig.width=20, fig.height=10}
+par(mfrow=c(1,2), mar=c(5,3,4,1), cex.main=1.5, cex.lab=1.5)
+boxplot(roll_belt ~ classe, data=data3, main="raw measurements dataset")
+boxplot(roll_belt_mean ~ classe, data=win_summ, ylim=c(-5, 25), main="window summary dataset")
+```
+<p style="text-align: center;font-size=90%" markdown="1"> Figure 3 - spread of values for "roll belt"</p>
+
+
+The boxplots above show how the spread of values is different for the (clean, unscaled) raw measurements dataset, and the summary dataset, for one particular variable. In the first plot there is hardly a distinction in interquartile range for the five classes, in the second at least class E is clearly distinct from the others.
+
+```{r memCleanup, echo=FALSE}
+# rm(data1, data1o, data2, data2b,data4)   # remove all datasets which are not used in the sequel
+```
+
+### 4. Model Selection
+
+Six different approaches will be tried for training a class-prediction ML algorithm. In all cases a random forest will be used. The differences lie in the dataset used as a starting point, and the way train/test splitting is performed:
+
+- input dataset: raw measurements, summaries by window, raw measurements for one user only, summary statistics for one user only
+- train/test splitting: stratified based on class, leave-one-subject-out, by time series sequence.
+
+<br>
+
+#### **Train/Test Splitting**
+
+The two datasets available at the end of "Feature Selection", "train3" and "win_summ", will be split in different ways into train and test sets, to test different things. Note that by default, in caret::train() the training set is split again into different groups (to perfrom e.g. cross-validation), and this in-train splitting must happen in the same way as the first train/test split.
+
+The "leave-one-subject-out" splitting tests whether it is possble to make predictions for a new user, whose data was not included in the training set. To achieve optimal model selection during training, the train indices must be grouped by the caret::groupKFold() function. The rationale for this can be read in the caret documentation "Important group splitting" ([gs]).
+
+Splitting by time series aims at testing if a new measurement sequence of a particular user can be accurately predicted if: 
+
+- the training set consisted of measurements of *all classes* belonging to that user,
+- no *other* users were included in the training set.
+
+For this purpose one test person was chosen, and for the time series of each class: the first 80% measurements were used as training, and the last 20% as test set. 
+
+
+```{r fset1}
+library(caret)
+
+data3 <- subset(data3, select=-c(color, num_window))              # remove columns not needed for training
+win_summ_df <- select(win_summ, -num_window) %>% as.data.frame(.) # change type (and name!) as dfs are easier to handle
+```
+
+```{r }
+# I. all users are included in train set; using raw measurements (RM); prepare for regular CV
+set.seed(123)
+trainRM_idx <- createDataPartition(data3$classe, p = .8, list = FALSE)
+train_RM1 <- data3[trainRM_idx,] %>% select(-user_name)
+test_RM1 <- data3[-trainRM_idx,]
+```
+
+```{r }
+# II. 5 out of 6 users are included in train set; using RMs; prepare for grouped K-fold CV
+test_RM2 <- subset(data3, user_name=="jeremy")
+train_RM2_tmp <- subset(data3, user_name!="jeremy")
+set.seed(234)
+fold_idx_RM2 <- groupKFold(train_RM2_tmp$user_name, k = 5)
+train_RM2 <- select(train_RM2_tmp, -c(user_name))           # remove non-measurement vars
+```
+```{r }
+# III. all users are included in train set; using window summaries; prepare for regular CV
+set.seed(345)
+trainWS1_idx <- createDataPartition(win_summ_df$classe, p = .8, list = FALSE, times = 1)
+train_WS1 <- win_summ_df[trainWS1_idx,] %>% select(-user_name)
+test_WS1 <- win_summ_df[-trainWS1_idx,]
+```
+```{r }
+# IV. out of 6 users are included in train set; using window summaries; prepare for grouped K-fold CV
+test_WS2 <- filter(win_summ_df, user_name=="jeremy")
+train_WS2_tmp <- filter(win_summ_df, user_name!="jeremy")
+set.seed(456)
+fold_idx_WS2 <- groupKFold(train_WS2_tmp$user_name, k = 5)
+train_WS2 <- select(train_WS2_tmp, -c(user_name))           # remove non-measurement vars
+```
+```{r }
+# V. train & test set contain one user only; using raw measurements; prepare for time series (TS) prediction
+jeremy_RM <- filter(data3, user_name=="jeremy") %>% select(-user_name)
+class_count = table(jeremy_RM$classe)    # how many in each class
+end_idx = cumsum(class_count);         test_perc = round(class_count * 0.2, 0)
+start_idx_test = end_idx-test_perc+1;  end_idx_test = end_idx
+m = cbind(start_idx_test, end_idx_test)
+test_idx <- unlist(apply(m, 1, function(x) seq(x["start_idx_test"], x["end_idx_test"])))
+train_JRM <- jeremy_RM[-test_idx,]; test_JRM <- jeremy_RM[test_idx,]
+```
+```{r }
+# VI. train & test set contain one user only; using window summaries; prepare for TS prediction
+jeremy_WS <- filter(win_summ_df, user_name=="jeremy") %>% select(-user_name)
+class_count = table(jeremy_WS$classe);     end_idx = cumsum(class_count)
+test_perc = round(class_count * 0.2, 0)
+start_idx_test = end_idx-test_perc+1;      end_idx_test = end_idx
+m = cbind(start_idx_test, end_idx_test)
+test_idx_WS <- unlist(apply(m, 1, function(x) seq(x["start_idx_test"], x["end_idx_test"])))
+train_JWS <- jeremy_WS[-test_idx_WS,]; test_JWS <- jeremy_WS[test_idx_WS,]
+```
+<br>
+
+#### **Training**
+
+Six random forests were trained, corresponding to the six approaches mentioned at the beginning of this section. Model selection was performed by evaluating the following hyper-parameters:
+
+* how many variables to sample while growing a tree: the "mtry" parameter,
+* how many trees to grow in each forest.
+
+```{r train_setup,  message=FALSE, warnings=FALSE}
+
+library(parallel); library(doParallel)
+cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(cluster)
+
+conf_matrices <- list()  # will contain TEST set results
+```
+```{r train_RM}
+# I. all users are included; using raw measurements (RM)
+fitControl_RM1 <- trainControl(method = "cv", number = 5)    # the "allow_parallel" argument is by default true.
+rf_RM1 <- train(classe ~ ., data=train_RM1, method="rf", trControl= fitControl_RM1, ntree=200)
+yhat_RM1 <- predict(rf_RM1, test_RM1)
+conf_matrices[["RM1"]] <- confusionMatrix(yhat_RM1, test_RM1$classe)
+```
+```{r train_RM2}
+# II. 5 out of 6 users are included in train set; using raw measurements
+fitControl_RM2 <- trainControl(index=fold_idx_RM2, method = "cv", number=5)
+rf_RM2 <- train(classe ~ ., data=train_RM2, method="rf", trControl= fitControl_RM2, ntree=200)
+conf_matrices[["RM2"]]  <- confusionMatrix(predict(rf_RM2, test_RM2), test_RM2$classe)
+```
+```{r train_WS1}
+# III. all users are included; using summary statistics
+rf_WS1 <- train(classe ~ ., data=train_WS1, method="rf", trControl=trainControl(method="cv", number=5), ntree=125)
+conf_matrices[["WS1"]]  <- confusionMatrix(predict(rf_WS1, test_WS1), test_WS1$classe)
+```
+```{r train_WS2}
+# IV. 5 out of 6 users are included in train set; using summary statistics
+fitControl_WS2 <- trainControl(index=fold_idx_WS2, method = "cv", number=5)
+rf_WS2 <- train(classe ~ ., data=train_WS2, method="rf", trControl= fitControl_WS2, ntree=120)
+conf_matrices[["WS2"]]  <- confusionMatrix(predict(rf_WS2, test_WS2), test_WS2$classe)
+```
+```{r train_JRM}
+# V. one user only; using raw measurements
+rf_JRM <- train(classe ~ ., data=train_JRM, method="rf", trControl=trainControl(method="cv", number=5), ntree=100)
+conf_matrices[["JRM"]]  <- confusionMatrix(predict(rf_JRM, test_JRM), test_JRM$classe)
+```
+```{r train_JWS}
+# VI. one user only; using summary statistics
+rf_JWS <- train(classe ~ ., data=train_JWS, method="rf", trControl=trainControl(method="cv", number=5), ntree=25)
+conf_matrices[["JWS"]]  <- confusionMatrix(predict(rf_JWS, test_JWS), test_JWS$classe)
+```
+
+<br>
+
+### 5. Results
+The accuracy-related performance measures on the various **test** sets are shown in below table. An interpretation of the results can be found below the table.
+
+```{r table3 }
+
+results <- data.frame(data_set=c(rep(c("regular CV", "group KFold"), times=2), "raw measurements", "window summary"), classA=NA, classB=NA, classC=NA, classD=NA, classE=NA, Overall=NA)
+results[,2:7] = t(sapply(conf_matrices, function(x) c(x$byClass[,"Balanced Accuracy"], x$overall["Accuracy"])))
+
+table_color <- "background-color: #98F5FF; color: #404040;"
+kable(results, "html", col.names = c("", "class A", "class B", "class C", "class D", "class E", "All")) %>%
+  kable_styling("bordered", full_width = F) %>%
+  add_header_above(c(" ", "Balanced Accuracy" = 5, "Accuracy" = 1)) %>%
+  group_rows("Raw measurements", 1, 2, label_row_css = table_color ) %>%
+  group_rows("Window summary", 3, 4, label_row_css = table_color)  %>%
+  group_rows("One user only", 5, 6, label_row_css = table_color)
+```
+<p style="text-align: center;font-size=90%" markdown="1"> Table - accuracy related scores for test sets</p>
+<br>
+
+Relating to the **raw measurements** dataset:
+
+1. The test accuracy of the first experiment is suspiciously high, `r results[1, 7]`. The test set was created by randomly extracting observations from the time series. Can the algorithm figure out from which user and time series sequence the observations come? This ability does not seem to be particularly relevant for practical applications of qualitative activity recognition.
+2. It is not possible to predict quality of execution for a *new* user; the overall accuracy of `r results[2, 7]` is close to 0.2, which could be achieved by random guessing. This score could most probably be improved by including measurements of many more users.
+
+Relating to the **windows summary** dataset:
+
+3. The test windows in this experiment were randomly extracted from the time series, as in experiment 1. Therefore, similar to  experiment 1, the algorithm probably remembers from which user and time series sequence the windows come. This is a plausible explanation for why this experiment performs better than the next one (`r results[3, 7]` vs. `r results[4, 7]`).
+4. The prediction capabilities for a *new* user using the summary approach are considerably better than when using raw measurements (`r results[4, 7]` vs. `r results[2, 7]`). Apparently the summary statistics are capable of extracting the fundamental patterns of each class.
+
+Relating to the **one user only** dataset:
+
+5. The raw measurements scores are better than the windows summary scores (`r results[5, 7]` vs. `r results[6, 7]`). This can be partly attributed to the capability of random forests to make sense of noisy data. More observations in the training set would surely improve this performance.<br>
+Note that this score cannot be compared to the score of experiment 1, as the test set used in this experiment is one consecutive *sequence* of observations. This is much harder to predict than randomly selected observations which have similar neighbours in the training set (at times t-1 and t+1).
+6. Especially the windows summary approach would benefit from more observations. Further, by splitting up the time series from the training set in more even time chunks than available through the "num_windows" variable, a much better score can be expected.
+
+<br>
+
+#### **Predicting validation set**
+A perfect prediction of the validation set can be achieved by using the raw measurements of the original dataset and a random forest.
+
+```{r finalTrain, cache=TRUE}
+train <- select(data1, c(1, 6:ncol(data1)))
+fitControl_raw <- trainControl(method = "cv", number = 5)    
+rf_raw <- train(classe ~ ., data=train, method="rf", trControl= fitControl_raw, ntree=200)
+```
+```{r}
+predict(rf_raw, valid1)
+```
+
+
+[qar]: http://web.archive.org/web/20161217164008/http://groupware.les.inf.puc-rio.br:80/public/papers/2013.Velloso.QAR-WLE.pdf
+[har]: http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har
+[wle]: http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har#weight_lifting_exercises
+[gs]: https://topepo.github.io/caret/data-splitting.html#simple-splitting-with-important-groups
